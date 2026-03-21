@@ -19,9 +19,9 @@
 #include <cstring>
 
 const int   CHUNK_SIZE           = 16;
-const int   CHUNK_HEIGHT         = 512;
-const int   SECTION_HEIGHT        = 16;   // vertical sub-mesh height
-const int   NUM_SECTIONS          = CHUNK_HEIGHT / SECTION_HEIGHT; // 32
+const int   CHUNK_HEIGHT         = 320;  // was 512 — surface sits at ~200, cuts gen 38%
+const int   SECTION_HEIGHT        = 16;   // must stay 16 — uint16 index buffer caps at 65535 verts
+const int   NUM_SECTIONS          = CHUNK_HEIGHT / SECTION_HEIGHT; // 20 (was 32 @ 512)
 const float BLOCK_SIZE           = 1.0f;
 const int   RENDER_DISTANCE      = 3;
 const int   MAX_BUILDS_PER_FRAME = 4;
@@ -67,32 +67,63 @@ uniform int   uLightCount;
 uniform vec3  uLightPos[8];
 uniform vec3  uLightColor[8];
 out vec4 finalColor;
+
+// Per-block brightness variation — same hash as C++ BlockVariation.
+// Computed in the fragment shader from world position so greedy-merged quads
+// still show per-block variation without needing per-vertex baking.
+float BlockVariation(vec3 blockPos) {
+    uvec3 p = uvec3(ivec3(blockPos));
+    uint h = p.x*374761393u + p.y*1234567u + p.z*914729u;
+    h = (h ^ (h>>13u)) * 1664525u + 1013904223u;
+    return 0.88 + float((h>>8u) & 255u) / 255.0 * 0.24;
+}
+
 void main() {
-    vec3  n        = normalize(fragLight.rgb * 2.0 - 1.0);
-    float skyFact  = fragLight.a;
+    vec3  n       = normalize(fragLight.rgb * 2.0 - 1.0);
+    float skyFact = fragLight.a;   // just sky-exposure now, no variation baked in
 
-    float sunD     = max(dot(n, normalize(uSunDir)), 0.0);
-    vec3  sunL     = uSunColor * uSunIntensity * sunD;
+    // ── World-space UV tiling ──────────────────────────────────────────────────
+    // fragUV.x = tile base U  (u0 = tile_index / 54.0), same at all 4 vertices.
+    // fragUV.y = 0 (unused).
+    // We compute the within-tile UV from world position so any size greedy-merged
+    // quad tiles correctly — no UV seams regardless of merge rectangle size.
+    const float TILE_W = 1.0 / 54.0;   // 1 / ATLAS_TILES
+    vec2 worldUV;
+    if(abs(n.y) > 0.5) {
+        // Top / bottom face — tile in XZ
+        worldUV = vec2(fract(fragWorldPos.x), fract(fragWorldPos.z));
+    } else if(abs(n.x) > 0.5) {
+        // East / west face — tile in ZY
+        worldUV = vec2(fract(fragWorldPos.z), 1.0 - fract(fragWorldPos.y));
+    } else {
+        // North / south face — tile in XY
+        worldUV = vec2(fract(fragWorldPos.x), 1.0 - fract(fragWorldPos.y));
+    }
+    vec2 uv = vec2(fragUV.x + worldUV.x * TILE_W, worldUV.y);
 
-    float skyA     = (n.y * 0.5 + 0.5) * 0.6;
-    vec3  skyL     = uSkyColor * skyA * skyFact;
+    // ── Per-block variation (shader-side) ─────────────────────────────────────
+    // Move 0.5 units into the block from the face surface to find the block origin.
+    vec3 blockPos = floor(fragWorldPos - n * 0.5);
+    float var = BlockVariation(blockPos);
 
-    // Raised floor from 0.06→0.10 so caves aren't pitch-black without torches
-    vec3  ambL     = vec3(0.10 + 0.05 * skyFact);
+    // ── Lighting ──────────────────────────────────────────────────────────────
+    float sunD  = max(dot(n, normalize(uSunDir)), 0.0);
+    vec3  sunL  = uSunColor * uSunIntensity * sunD;
+    float skyA  = (n.y * 0.5 + 0.5) * 0.6;
+    vec3  skyL  = uSkyColor * skyA * skyFact;
+    vec3  ambL  = vec3(0.10 + 0.05 * skyFact);
 
-    // Point light contribution from torches (8 lights max — halves shader work vs 16)
     vec3 ptL = vec3(0.0);
     for(int i=0;i<uLightCount;i++){
-        vec3  toL  = uLightPos[i] - fragWorldPos;
-        float dist2= dot(toL,toL);
-        // Reduced coefficient 0.06→0.04 extends useful torch range from ~8 to ~10 blocks
-        float att  = 1.0 / (1.0 + dist2 * 0.04);
-        float diff = max(dot(n, normalize(toL)), 0.0);
-        float ambient = att * 0.30;  // slightly stronger soft ambient wrap
+        vec3  toL   = uLightPos[i] - fragWorldPos;
+        float dist2 = dot(toL,toL);
+        float att   = 1.0 / (1.0 + dist2 * 0.04);
+        float diff  = max(dot(n, normalize(toL)), 0.0);
+        float ambient = att * 0.30;
         ptL += uLightColor[i] * (diff * att + ambient);
     }
 
-    vec3 col  = texture(texture0, fragUV).rgb * (sunL + skyL + ambL + ptL);
+    vec3 col  = texture(texture0, uv).rgb * var * (sunL + skyL + ambL + ptL);
     float dist = length(fragWorldPos.xz - camPos.xz);
     float fogT = clamp((dist - fogStart) / (fogEnd - fogStart), 0.0, 1.0);
     col = mix(col, fogColor, fogT * fogT);
@@ -371,16 +402,14 @@ float BlockVariation(int wx, int wy, int wz) {
 
 // Packs face data into vertex color for dynamic lighting in the shader:
 //   RGB = face normal packed from -1..1 into 0..255
-//   A   = skyFactor * blockVariation  (sky exposure × per-block noise)
-// The shader unpacks the normal and computes sun diffuse against the live sunDir.
+//   A   = skyFactor (sky exposure — block variation is now computed per-fragment in shader)
 Color VertexLight(int face, int wx, int wy, int wz, float skyFactor) {
-    Vector3 n   = FACE_NORMAL[face];
-    float   var = BlockVariation(wx, wy, wz);
-    // Pack normal: 0=−1, 128=0, 255=+1
+    (void)wx; (void)wy; (void)wz; // world pos no longer needed here
+    Vector3 n = FACE_NORMAL[face];
     unsigned char r = (unsigned char)((n.x + 1.0f) * 0.5f * 255.0f);
     unsigned char g = (unsigned char)((n.y + 1.0f) * 0.5f * 255.0f);
     unsigned char b = (unsigned char)((n.z + 1.0f) * 0.5f * 255.0f);
-    unsigned char a = (unsigned char)Clamp(skyFactor * var * 255.0f, 0.0f, 255.0f);
+    unsigned char a = (unsigned char)Clamp(skyFactor * 255.0f, 0.0f, 255.0f);
     return {r, g, b, a};
 }
 
@@ -918,12 +947,15 @@ struct ReadyMesh {
                  vertCount=0; triCount=0; }
 };
 
-// Pure CPU vertex filler — no GPU calls, safe to run on any thread.
-// Uses a local tmp vector for counting, then MemAlloc's exact-sized buffers.
-// Main thread receives pre-allocated buffers — zero alloc/copy on drain.
+// Pure CPU vertex filler — greedy meshing.
+// For each of 6 face directions, sweeps a 2D layer grid and merges adjacent same-type
+// exposed faces into the largest possible axis-aligned rectangles. This reduces quad count
+// on flat surfaces (stone walls, grass plains, cave ceilings) from N² to ~1.
+//
+// UV encoding: fragUV.x = u0 (tile base), fragUV.y = 0. The fragment shader tiles
+// using world-space fract(fragWorldPos) so any size merged quad looks correct.
 static void FillMeshData(const MeshJob& job, ReadyMesh& out){
     out.Free();
-    unsigned short vi=0;
     int yMin=job.yMin, yMax=yMin+SECTION_HEIGHT;
 
     auto GetB=[&](int x,int y,int z)->BlockType{
@@ -933,107 +965,233 @@ static void FillMeshData(const MeshJob& job, ReadyMesh& out){
         if(x>=CHUNK_SIZE) return (yo>=0&&yo<SECTION_HEIGHT+2)?job.nbPX[yo][z]:BLOCK_AIR;
         if(z<0)           return (yo>=0&&yo<SECTION_HEIGHT+2)?job.nbNZ[x][yo]:BLOCK_AIR;
         if(z>=CHUNK_SIZE) return (yo>=0&&yo<SECTION_HEIGHT+2)?job.nbPZ[x][yo]:BLOCK_AIR;
-        // Own section — read directly from live chunk blocks (no copy)
         return job.liveBlocks[x*CHUNK_HEIGHT*CHUNK_SIZE + y*CHUNK_SIZE + z];
     };
-    auto IsAirL=[&](int x,int y,int z)->bool{ BlockType bt=GetB(x,y,z); return bt==BLOCK_AIR||bt==BLOCK_TORCH; };
-
+    auto IsAirL=[&](int x,int y,int z)->bool{
+        BlockType bt=GetB(x,y,z); return bt==BLOCK_AIR||bt==BLOCK_TORCH;
+    };
     auto ColSkyFactor=[&](int bx,int bz,int fromY)->float{
         int sh;
-        if(bx<0)           sh=job.snbNX[bz<0?0:bz>=CHUNK_SIZE?CHUNK_SIZE-1:bz];
+        if(bx<0)                sh=job.snbNX[bz<0?0:bz>=CHUNK_SIZE?CHUNK_SIZE-1:bz];
         else if(bx>=CHUNK_SIZE) sh=job.snbPX[bz<0?0:bz>=CHUNK_SIZE?CHUNK_SIZE-1:bz];
-        else if(bz<0)      sh=job.snbNZ[bx];
+        else if(bz<0)           sh=job.snbNZ[bx];
         else if(bz>=CHUNK_SIZE) sh=job.snbPZ[bx];
-        else sh=job.surfH[bx][bz];
+        else                    sh=job.surfH[bx][bz];
         int solidAbove=std::max(0,std::min(8,sh-fromY));
         return Clamp(1.0f-solidAbove*0.35f,0.0f,1.0f);
     };
+    auto CalcAO=[&](int bx,int by,int bz,int s1x,int s1y,int s1z,int s2x,int s2y,int s2z)->float{
+        bool a=!IsAirL(bx+s1x,by+s1y,bz+s1z);
+        bool b=!IsAirL(bx+s2x,by+s2y,bz+s2z);
+        bool c=!IsAirL(bx+s1x+s2x,by+s1y+s2y,bz+s1z+s2z);
+        if(a&&b) return 0.0f;
+        return 1.0f-(float)(a+b+c)*0.12f;
+    };
+    auto VCol=[](Color base,float ao)->Color{
+        return {base.r,base.g,base.b,(unsigned char)Clamp((float)base.a*ao,0.0f,255.0f)};
+    };
 
-    // Single-pass: pre-allocate at worst case (all faces exposed), fill directly.
-    // Avoids double-iteration — workers do one pass instead of two.
-    // Worst case: 16×16×16 × 3 exposed faces average = 12,288 quads
     const int MAX_QUADS = CHUNK_SIZE*SECTION_HEIGHT*CHUNK_SIZE*3;
-    out.verts    = (float*)         MemAlloc(MAX_QUADS*4*3*sizeof(float));
-    out.uvs      = (float*)         MemAlloc(MAX_QUADS*4*2*sizeof(float));
-    out.cols     = (unsigned char*) MemAlloc(MAX_QUADS*4*4*sizeof(unsigned char));
-    out.ids      = (unsigned short*)MemAlloc(MAX_QUADS*2*3*sizeof(unsigned short));
-    // vertCount/triCount set at end based on actual vi
+    out.verts = (float*)         MemAlloc(MAX_QUADS*4*3*sizeof(float));
+    out.uvs   = (float*)         MemAlloc(MAX_QUADS*4*2*sizeof(float));
+    out.cols  = (unsigned char*) MemAlloc(MAX_QUADS*4*4*sizeof(unsigned char));
+    out.ids   = (unsigned short*)MemAlloc(MAX_QUADS*2*3*sizeof(unsigned short));
 
+    unsigned short vi=0;
     int vi3=0, vi2=0, ci=0, ii=0;
-    auto Quad=[&](Vector3 a,Vector3 b,Vector3 c,Vector3 d,float u0,float u1,
+
+    // Quad helper — stores u0 at all 4 vertices (world-space UV computed in shader)
+    auto Quad=[&](Vector3 a,Vector3 b,Vector3 c,Vector3 d,
+                  float u0, float /*u1_unused*/,
                   Color c0,Color c1,Color c2,Color c3){
-        out.verts[vi3+0]=a.x; out.verts[vi3+1]=a.y; out.verts[vi3+2]=a.z;
-        out.verts[vi3+3]=b.x; out.verts[vi3+4]=b.y; out.verts[vi3+5]=b.z;
-        out.verts[vi3+6]=c.x; out.verts[vi3+7]=c.y; out.verts[vi3+8]=c.z;
-        out.verts[vi3+9]=d.x; out.verts[vi3+10]=d.y;out.verts[vi3+11]=d.z;
+        out.verts[vi3+ 0]=a.x; out.verts[vi3+ 1]=a.y; out.verts[vi3+ 2]=a.z;
+        out.verts[vi3+ 3]=b.x; out.verts[vi3+ 4]=b.y; out.verts[vi3+ 5]=b.z;
+        out.verts[vi3+ 6]=c.x; out.verts[vi3+ 7]=c.y; out.verts[vi3+ 8]=c.z;
+        out.verts[vi3+ 9]=d.x; out.verts[vi3+10]=d.y; out.verts[vi3+11]=d.z;
         vi3+=12;
-        out.uvs[vi2+0]=u0; out.uvs[vi2+1]=1;
-        out.uvs[vi2+2]=u1; out.uvs[vi2+3]=1;
-        out.uvs[vi2+4]=u1; out.uvs[vi2+5]=0;
-        out.uvs[vi2+6]=u0; out.uvs[vi2+7]=0;
+        // UV: just tile-base u0 at all corners; fragment shader tiles from world pos
+        for(int i=0;i<4;i++){ out.uvs[vi2+i*2]=u0; out.uvs[vi2+i*2+1]=0.0f; }
         vi2+=8;
         Color cls[4]={c0,c1,c2,c3};
-        for(auto& cl:cls){
-            out.cols[ci++]=cl.r; out.cols[ci++]=cl.g;
-            out.cols[ci++]=cl.b; out.cols[ci++]=cl.a;
-        }
-        out.ids[ii+0]=vi; out.ids[ii+1]=vi+1; out.ids[ii+2]=vi+2;
-        out.ids[ii+3]=vi; out.ids[ii+4]=vi+2; out.ids[ii+5]=vi+3;
+        for(auto& cl:cls){ out.cols[ci++]=cl.r; out.cols[ci++]=cl.g; out.cols[ci++]=cl.b; out.cols[ci++]=cl.a; }
+        out.ids[ii+0]=vi; out.ids[ii+1]=(unsigned short)(vi+1); out.ids[ii+2]=(unsigned short)(vi+2);
+        out.ids[ii+3]=vi; out.ids[ii+4]=(unsigned short)(vi+2); out.ids[ii+5]=(unsigned short)(vi+3);
         ii+=6; vi+=4;
     };
 
-    for(int x=0;x<CHUNK_SIZE;x++) for(int y=yMin;y<yMax;y++) for(int z=0;z<CHUNK_SIZE;z++){
-        BlockType t=GetB(x,y,z); if(t==BLOCK_AIR||t==BLOCK_TORCH) continue;
-        float bwx=(job.cx*CHUNK_SIZE+x)*BLOCK_SIZE;
-        float bwy=y*BLOCK_SIZE, bwz=(job.cz*CHUNK_SIZE+z)*BLOCK_SIZE, s=BLOCK_SIZE;
-        int iwx=job.cx*CHUNK_SIZE+x, iwz=job.cz*CHUNK_SIZE+z;
+    // ── Greedy sweep helper: find and emit merged rectangles for a 2D mask ───
+    // mask[a][b] = block type (BLOCK_AIR = not visible).
+    // For horizontal faces (face=0,1): a=x, b=z; for vertical: as specified.
+    // After sweep, each rectangle calls emitFn(a0,b0,aw,bh) to emit the quad.
+    BlockType mask[CHUNK_SIZE][CHUNK_SIZE];
+    bool      used[CHUNK_SIZE][CHUNK_SIZE];
 
-        float sfOwn=ColSkyFactor(x,z,y+1),  sfPZ=ColSkyFactor(x,z+1,y+1);
-        float sfNZ=ColSkyFactor(x,z-1,y+1), sfPX=ColSkyFactor(x+1,z,y+1);
-        float sfNX=ColSkyFactor(x-1,z,y+1);
+    auto Sweep=[&](auto emitFn){
+        memset(used,0,sizeof(used));
+        for(int a=0;a<CHUNK_SIZE;a++){
+            for(int b=0;b<CHUNK_SIZE;){
+                if(!mask[a][b]||used[a][b]){b++;continue;}
+                BlockType t=mask[a][b];
+                // Extend in b
+                int bw=1;
+                while(b+bw<CHUNK_SIZE&&mask[a][b+bw]==t&&!used[a][b+bw]) bw++;
+                // Extend in a
+                int aw=1;
+                while(a+aw<CHUNK_SIZE){
+                    bool ok=true;
+                    for(int j=0;j<bw;j++)
+                        if(mask[a+aw][b+j]!=t||used[a+aw][b+j]){ok=false;break;}
+                    if(!ok)break; aw++;
+                }
+                for(int i=0;i<aw;i++) for(int j=0;j<bw;j++) used[a+i][b+j]=true;
+                emitFn(a,b,aw,bw,t);
+                b+=bw;
+            }
+        }
+    };
 
-        auto CalcAO=[&](int bx,int by,int bz,int s1x,int s1y,int s1z,int s2x,int s2y,int s2z)->float{
-            bool a=!IsAirL(bx+s1x,by+s1y,bz+s1z);
-            bool b=!IsAirL(bx+s2x,by+s2y,bz+s2z);
-            bool c=!IsAirL(bx+s1x+s2x,by+s1y+s2y,bz+s1z+s2z);
-            if(a&&b) return 0.0f;
-            return 1.0f-(float)(a+b+c)*0.12f;
-        };
-        auto VCol=[](Color base,float ao)->Color{
-            return {base.r,base.g,base.b,(unsigned char)Clamp((float)base.a*ao,0.0f,255.0f)};
-        };
+    float ox=(float)(job.cx*CHUNK_SIZE), oz=(float)(job.cz*CHUNK_SIZE);
 
-        float u0,u1; Color bc,v0,v1,v2,v3;
-        if(IsAirL(x,y+1,z)){ TileUV(GetTile(t,0),u0,u1); bc=VertexLight(0,iwx,y,iwz,sfOwn);
-            v0=VCol(bc,CalcAO(x,y,z,-1,+1,0,0,+1,+1)); v1=VCol(bc,CalcAO(x,y,z,+1,+1,0,0,+1,+1));
-            v2=VCol(bc,CalcAO(x,y,z,+1,+1,0,0,+1,-1)); v3=VCol(bc,CalcAO(x,y,z,-1,+1,0,0,+1,-1));
-            Quad({bwx,bwy+s,bwz+s},{bwx+s,bwy+s,bwz+s},{bwx+s,bwy+s,bwz},{bwx,bwy+s,bwz},u0,u1,v0,v1,v2,v3);}
-        if(IsAirL(x,y-1,z)){ TileUV(GetTile(t,1),u0,u1); bc=VertexLight(1,iwx,y,iwz,sfOwn);
-            v0=VCol(bc,CalcAO(x,y,z,-1,-1,0,0,-1,-1)); v1=VCol(bc,CalcAO(x,y,z,+1,-1,0,0,-1,-1));
-            v2=VCol(bc,CalcAO(x,y,z,+1,-1,0,0,-1,+1)); v3=VCol(bc,CalcAO(x,y,z,-1,-1,0,0,-1,+1));
-            Quad({bwx,bwy,bwz},{bwx+s,bwy,bwz},{bwx+s,bwy,bwz+s},{bwx,bwy,bwz+s},u0,u1,v0,v1,v2,v3);}
-        if(IsAirL(x,y,z+1)){ TileUV(GetTile(t,2),u0,u1); bc=VertexLight(2,iwx,y,iwz,sfPZ);
-            v0=VCol(bc,CalcAO(x,y,z,-1,0,+1,0,-1,+1)); v1=VCol(bc,CalcAO(x,y,z,+1,0,+1,0,-1,+1));
-            v2=VCol(bc,CalcAO(x,y,z,+1,0,+1,0,+1,+1)); v3=VCol(bc,CalcAO(x,y,z,-1,0,+1,0,+1,+1));
-            Quad({bwx,bwy,bwz+s},{bwx+s,bwy,bwz+s},{bwx+s,bwy+s,bwz+s},{bwx,bwy+s,bwz+s},u0,u1,v0,v1,v2,v3);}
-        if(IsAirL(x,y,z-1)){ TileUV(GetTile(t,3),u0,u1); bc=VertexLight(3,iwx,y,iwz,sfNZ);
-            v0=VCol(bc,CalcAO(x,y,z,+1,0,-1,0,-1,-1)); v1=VCol(bc,CalcAO(x,y,z,-1,0,-1,0,-1,-1));
-            v2=VCol(bc,CalcAO(x,y,z,-1,0,-1,0,+1,-1)); v3=VCol(bc,CalcAO(x,y,z,+1,0,-1,0,+1,-1));
-            Quad({bwx+s,bwy,bwz},{bwx,bwy,bwz},{bwx,bwy+s,bwz},{bwx+s,bwy+s,bwz},u0,u1,v0,v1,v2,v3);}
-        if(IsAirL(x+1,y,z)){ TileUV(GetTile(t,4),u0,u1); bc=VertexLight(4,iwx,y,iwz,sfPX);
-            v0=VCol(bc,CalcAO(x,y,z,+1,0,+1,+1,-1,0)); v1=VCol(bc,CalcAO(x,y,z,+1,0,-1,+1,-1,0));
-            v2=VCol(bc,CalcAO(x,y,z,+1,0,-1,+1,+1,0)); v3=VCol(bc,CalcAO(x,y,z,+1,0,+1,+1,+1,0));
-            Quad({bwx+s,bwy,bwz+s},{bwx+s,bwy,bwz},{bwx+s,bwy+s,bwz},{bwx+s,bwy+s,bwz+s},u0,u1,v0,v1,v2,v3);}
-        if(IsAirL(x-1,y,z)){ TileUV(GetTile(t,5),u0,u1); bc=VertexLight(5,iwx,y,iwz,sfNX);
-            v0=VCol(bc,CalcAO(x,y,z,-1,0,-1,-1,-1,0)); v1=VCol(bc,CalcAO(x,y,z,-1,0,+1,-1,-1,0));
-            v2=VCol(bc,CalcAO(x,y,z,-1,0,+1,-1,+1,0)); v3=VCol(bc,CalcAO(x,y,z,-1,0,-1,-1,+1,0));
-            Quad({bwx,bwy,bwz},{bwx,bwy,bwz+s},{bwx,bwy+s,bwz+s},{bwx,bwy+s,bwz},u0,u1,v0,v1,v2,v3);}
+    // ── Face +Y (top) ────────────────────────────────────────────────────────
+    for(int y=yMin;y<yMax;y++){
+        for(int x=0;x<CHUNK_SIZE;x++) for(int z=0;z<CHUNK_SIZE;z++){
+            BlockType t=GetB(x,y,z);
+            mask[x][z]=(t!=BLOCK_AIR&&t!=BLOCK_TORCH&&IsAirL(x,y+1,z))?t:BLOCK_AIR;
+        }
+        float wy=(float)y;
+        Sweep([&](int x,int z,int xw,int zw,BlockType t){
+            float bwx=ox+x,bwz=oz+z,sw=(float)xw,sdz=(float)zw;
+            float sf0=ColSkyFactor(x,     z,     y+1);
+            float sf1=ColSkyFactor(x+xw-1,z,     y+1);
+            float sf2=ColSkyFactor(x+xw-1,z+zw-1,y+1);
+            float sf3=ColSkyFactor(x,     z+zw-1,y+1);
+            int iwx=job.cx*CHUNK_SIZE+x, iwz=job.cz*CHUNK_SIZE+z;
+            Color v0=VCol(VertexLight(0,iwx,y,iwz+zw-1,sf3),CalcAO(x,y,z+zw-1,-1,+1,0,0,+1,+1));
+            Color v1=VCol(VertexLight(0,iwx+xw-1,y,iwz+zw-1,sf2),CalcAO(x+xw-1,y,z+zw-1,+1,+1,0,0,+1,+1));
+            Color v2=VCol(VertexLight(0,iwx+xw-1,y,iwz,sf1),CalcAO(x+xw-1,y,z,+1,+1,0,0,+1,-1));
+            Color v3=VCol(VertexLight(0,iwx,y,iwz,sf0),CalcAO(x,y,z,-1,+1,0,0,+1,-1));
+            float u0,u1; TileUV(GetTile(t,0),u0,u1);
+            Quad({bwx,    wy+1,bwz+sdz},{bwx+sw,wy+1,bwz+sdz},
+                 {bwx+sw,wy+1,bwz},     {bwx,   wy+1,bwz},     u0,u1,v0,v1,v2,v3);
+        });
     }
-    // Set actual counts — vi is quad count, buffers may be over-allocated but that's fine
+
+    // ── Face -Y (bottom) ─────────────────────────────────────────────────────
+    for(int y=yMin;y<yMax;y++){
+        for(int x=0;x<CHUNK_SIZE;x++) for(int z=0;z<CHUNK_SIZE;z++){
+            BlockType t=GetB(x,y,z);
+            mask[x][z]=(t!=BLOCK_AIR&&t!=BLOCK_TORCH&&IsAirL(x,y-1,z))?t:BLOCK_AIR;
+        }
+        float wy=(float)y;
+        Sweep([&](int x,int z,int xw,int zw,BlockType t){
+            float bwx=ox+x,bwz=oz+z,sw=(float)xw,sdz=(float)zw;
+            float sf=ColSkyFactor(x,z,y);
+            int iwx=job.cx*CHUNK_SIZE+x, iwz=job.cz*CHUNK_SIZE+z;
+            Color v0=VCol(VertexLight(1,iwx,y,iwz,sf),     CalcAO(x,y,z,-1,-1,0,0,-1,-1));
+            Color v1=VCol(VertexLight(1,iwx+xw-1,y,iwz,sf),CalcAO(x+xw-1,y,z,+1,-1,0,0,-1,-1));
+            Color v2=VCol(VertexLight(1,iwx+xw-1,y,iwz+zw-1,sf),CalcAO(x+xw-1,y,z+zw-1,+1,-1,0,0,-1,+1));
+            Color v3=VCol(VertexLight(1,iwx,y,iwz+zw-1,sf),CalcAO(x,y,z+zw-1,-1,-1,0,0,-1,+1));
+            float u0,u1; TileUV(GetTile(t,1),u0,u1);
+            Quad({bwx,   wy,bwz},     {bwx+sw,wy,bwz},
+                 {bwx+sw,wy,bwz+sdz}, {bwx,   wy,bwz+sdz}, u0,u1,v0,v1,v2,v3);
+        });
+    }
+
+    // ── Face +Z (south) ──────────────────────────────────────────────────────
+    for(int z=0;z<CHUNK_SIZE;z++){
+        for(int x=0;x<CHUNK_SIZE;x++) for(int y=yMin;y<yMax;y++){
+            BlockType t=GetB(x,y,z);
+            mask[x][y-yMin]=(t!=BLOCK_AIR&&t!=BLOCK_TORCH&&IsAirL(x,y,z+1))?t:BLOCK_AIR;
+        }
+        float bwz=oz+z;
+        Sweep([&](int x,int yrel,int xw,int yh,BlockType t){
+            int y=yrel+yMin;
+            float bwx=ox+x,bwy=(float)y,sw=(float)xw,sh=(float)yh;
+            float sf0=ColSkyFactor(x,     z+1,y+1);
+            float sf1=ColSkyFactor(x+xw-1,z+1,y+1);
+            int iwx=job.cx*CHUNK_SIZE+x, iwz=job.cz*CHUNK_SIZE+z;
+            Color v0=VCol(VertexLight(2,iwx,y,iwz,sf0),  CalcAO(x,y,z,-1,0,+1,0,-1,+1));
+            Color v1=VCol(VertexLight(2,iwx+xw-1,y,iwz,sf1),CalcAO(x+xw-1,y,z,+1,0,+1,0,-1,+1));
+            Color v2=VCol(VertexLight(2,iwx+xw-1,y+yh-1,iwz,sf1),CalcAO(x+xw-1,y+yh-1,z,+1,0,+1,0,+1,+1));
+            Color v3=VCol(VertexLight(2,iwx,y+yh-1,iwz,sf0),CalcAO(x,y+yh-1,z,-1,0,+1,0,+1,+1));
+            float u0,u1; TileUV(GetTile(t,2),u0,u1);
+            Quad({bwx,   bwy,   bwz+1},{bwx+sw,bwy,   bwz+1},
+                 {bwx+sw,bwy+sh,bwz+1},{bwx,   bwy+sh,bwz+1}, u0,u1,v0,v1,v2,v3);
+        });
+    }
+
+    // ── Face -Z (north) ──────────────────────────────────────────────────────
+    for(int z=0;z<CHUNK_SIZE;z++){
+        for(int x=0;x<CHUNK_SIZE;x++) for(int y=yMin;y<yMax;y++){
+            BlockType t=GetB(x,y,z);
+            mask[x][y-yMin]=(t!=BLOCK_AIR&&t!=BLOCK_TORCH&&IsAirL(x,y,z-1))?t:BLOCK_AIR;
+        }
+        float bwz=oz+z;
+        Sweep([&](int x,int yrel,int xw,int yh,BlockType t){
+            int y=yrel+yMin;
+            float bwx=ox+x,bwy=(float)y,sw=(float)xw,sh=(float)yh;
+            float sf0=ColSkyFactor(x,     z-1,y+1);
+            float sf1=ColSkyFactor(x+xw-1,z-1,y+1);
+            int iwx=job.cx*CHUNK_SIZE+x, iwz=job.cz*CHUNK_SIZE+z;
+            Color v0=VCol(VertexLight(3,iwx+xw-1,y,iwz,sf1),CalcAO(x+xw-1,y,z,+1,0,-1,0,-1,-1));
+            Color v1=VCol(VertexLight(3,iwx,y,iwz,sf0),     CalcAO(x,y,z,-1,0,-1,0,-1,-1));
+            Color v2=VCol(VertexLight(3,iwx,y+yh-1,iwz,sf0),CalcAO(x,y+yh-1,z,-1,0,-1,0,+1,-1));
+            Color v3=VCol(VertexLight(3,iwx+xw-1,y+yh-1,iwz,sf1),CalcAO(x+xw-1,y+yh-1,z,+1,0,-1,0,+1,-1));
+            float u0,u1; TileUV(GetTile(t,3),u0,u1);
+            Quad({bwx+sw,bwy,   bwz},{bwx,   bwy,   bwz},
+                 {bwx,   bwy+sh,bwz},{bwx+sw,bwy+sh,bwz}, u0,u1,v0,v1,v2,v3);
+        });
+    }
+
+    // ── Face +X (east) ───────────────────────────────────────────────────────
+    for(int x=0;x<CHUNK_SIZE;x++){
+        for(int z=0;z<CHUNK_SIZE;z++) for(int y=yMin;y<yMax;y++){
+            BlockType t=GetB(x,y,z);
+            mask[z][y-yMin]=(t!=BLOCK_AIR&&t!=BLOCK_TORCH&&IsAirL(x+1,y,z))?t:BLOCK_AIR;
+        }
+        float bwx=ox+x;
+        Sweep([&](int z,int yrel,int zw,int yh,BlockType t){
+            int y=yrel+yMin;
+            float bwz=oz+z,bwy=(float)y,sdz=(float)zw,sh=(float)yh;
+            float sf0=ColSkyFactor(x+1,z,     y+1);
+            float sf1=ColSkyFactor(x+1,z+zw-1,y+1);
+            int iwx=job.cx*CHUNK_SIZE+x, iwz=job.cz*CHUNK_SIZE+z;
+            Color v0=VCol(VertexLight(4,iwx,y,iwz+zw-1,sf1),CalcAO(x,y,z+zw-1,+1,0,+1,+1,-1,0));
+            Color v1=VCol(VertexLight(4,iwx,y,iwz,sf0),     CalcAO(x,y,z,+1,0,-1,+1,-1,0));
+            Color v2=VCol(VertexLight(4,iwx,y+yh-1,iwz,sf0),CalcAO(x,y+yh-1,z,+1,0,-1,+1,+1,0));
+            Color v3=VCol(VertexLight(4,iwx,y+yh-1,iwz+zw-1,sf1),CalcAO(x,y+yh-1,z+zw-1,+1,0,+1,+1,+1,0));
+            float u0,u1; TileUV(GetTile(t,4),u0,u1);
+            Quad({bwx+1,bwy,   bwz+sdz},{bwx+1,bwy,   bwz},
+                 {bwx+1,bwy+sh,bwz},   {bwx+1,bwy+sh,bwz+sdz}, u0,u1,v0,v1,v2,v3);
+        });
+    }
+
+    // ── Face -X (west) ───────────────────────────────────────────────────────
+    for(int x=0;x<CHUNK_SIZE;x++){
+        for(int z=0;z<CHUNK_SIZE;z++) for(int y=yMin;y<yMax;y++){
+            BlockType t=GetB(x,y,z);
+            mask[z][y-yMin]=(t!=BLOCK_AIR&&t!=BLOCK_TORCH&&IsAirL(x-1,y,z))?t:BLOCK_AIR;
+        }
+        float bwx=ox+x;
+        Sweep([&](int z,int yrel,int zw,int yh,BlockType t){
+            int y=yrel+yMin;
+            float bwz=oz+z,bwy=(float)y,sdz=(float)zw,sh=(float)yh;
+            float sf0=ColSkyFactor(x-1,z,     y+1);
+            float sf1=ColSkyFactor(x-1,z+zw-1,y+1);
+            int iwx=job.cx*CHUNK_SIZE+x, iwz=job.cz*CHUNK_SIZE+z;
+            Color v0=VCol(VertexLight(5,iwx,y,iwz,sf0),     CalcAO(x,y,z,-1,0,-1,-1,-1,0));
+            Color v1=VCol(VertexLight(5,iwx,y,iwz+zw-1,sf1),CalcAO(x,y,z+zw-1,-1,0,+1,-1,-1,0));
+            Color v2=VCol(VertexLight(5,iwx,y+yh-1,iwz+zw-1,sf1),CalcAO(x,y+yh-1,z+zw-1,-1,0,+1,-1,+1,0));
+            Color v3=VCol(VertexLight(5,iwx,y+yh-1,iwz,sf0),CalcAO(x,y+yh-1,z,-1,0,-1,-1,+1,0));
+            float u0,u1; TileUV(GetTile(t,5),u0,u1);
+            Quad({bwx,bwy,   bwz},     {bwx,bwy,   bwz+sdz},
+                 {bwx,bwy+sh,bwz+sdz}, {bwx,bwy+sh,bwz},     u0,u1,v0,v1,v2,v3);
+        });
+    }
+
     if(vi==0){ out.Free(); return; }
     out.vertCount = vi*4;
     out.triCount  = vi*2;
-    // Trim to actual size (avoids wasting VRAM on GPU upload)
     out.verts = (float*)        MemRealloc(out.verts, vi*4*3*sizeof(float));
     out.uvs   = (float*)        MemRealloc(out.uvs,   vi*4*2*sizeof(float));
     out.cols  = (unsigned char*)MemRealloc(out.cols,  vi*4*4*sizeof(unsigned char));
@@ -1098,7 +1256,7 @@ struct Chunk {
         for(int x=0;x<CHUNK_SIZE;x++) for(int z=0;z<CHUNK_SIZE;z++){
             int wx=chunkX*CHUNK_SIZE+x, wz=chunkZ*CHUNK_SIZE+z;
             float n=noise.GetNoise((float)wx,(float)wz);
-            int h=(int)(n*12.0f)+440;
+            int h=(int)(n*12.0f)+200;
             surfaceH[x][z] = h; // bake terrain height for O(1) sky factor lookup
 
             for(int y=0;y<CHUNK_HEIGHT;y++){
@@ -1122,10 +1280,10 @@ struct Chunk {
                 if(base==BLOCK_STONE){
                     float ov =oreNoise.GetNoise((float)wx,(float)y,(float)wz);
                     float ov2=oreNoise.GetNoise((float)wx*1.7f+100,(float)y*1.7f,(float)wz*1.7f+100);
-                    if     (y<=380 && ov>0.55f && ov2>0.10f) base=BLOCK_COAL;
-                    else if(y<=300 && ov>0.62f && ov2>0.15f) base=BLOCK_IRON;
-                    else if(y<=180 && ov>0.70f && ov2>0.20f) base=BLOCK_GOLD;
-                    else if(y<=80  && ov>0.76f && ov2>0.25f) base=BLOCK_DIAMOND;
+                    if     (y<=180 && ov>0.55f && ov2>0.10f) base=BLOCK_COAL;
+                    else if(y<=130 && ov>0.62f && ov2>0.15f) base=BLOCK_IRON;
+                    else if(y<= 80 && ov>0.70f && ov2>0.20f) base=BLOCK_GOLD;
+                    else if(y<= 30 && ov>0.76f && ov2>0.25f) base=BLOCK_DIAMOND;
                 }
                 Set(x,y,z,base);
             }
@@ -1700,6 +1858,9 @@ struct World {
     int                     lastSortCZ    = 99999;
     float dayTime  = 0.25f;
     Vector3 sunDir = {1.0f, 0.18f, 0.6f};
+    int activeRD   = RENDER_DISTANCE; // can be lowered dynamically when FPS drops
+
+    void SetRenderDistance(int rd){ activeRD = rd; }
     float depthFade = 0.0f;
 
     // ── Thread pool for async chunk generation ────────────────────────────
@@ -1832,8 +1993,8 @@ struct World {
         }
 
 
-        float fogStart=(RENDER_DISTANCE-1.5f)*CHUNK_SIZE;
-        float fogEnd  =(RENDER_DISTANCE-0.3f)*CHUNK_SIZE;
+        float fogStart=(activeRD-1.5f)*CHUNK_SIZE;
+        float fogEnd  =(activeRD-0.3f)*CHUNK_SIZE;
         SetShaderValue(worldShader,locFogStart,&fogStart,SHADER_UNIFORM_FLOAT);
         SetShaderValue(worldShader,locFogEnd,  &fogEnd,  SHADER_UNIFORM_FLOAT);
 
@@ -1923,8 +2084,8 @@ struct World {
         fogCol[1] = fogCol[1]*(1.0f-depthFade) + caveFog[1]*depthFade;
         fogCol[2] = fogCol[2]*(1.0f-depthFade) + caveFog[2]*depthFade;
         // Also tighten fog range underground so caves feel dark quickly
-        float fogStart = (RENDER_DISTANCE-1.5f)*CHUNK_SIZE * (1.0f - depthFade*0.6f);
-        float fogEnd   = (RENDER_DISTANCE-0.3f)*CHUNK_SIZE * (1.0f - depthFade*0.5f);
+        float fogStart = (activeRD-1.5f)*CHUNK_SIZE * (1.0f - depthFade*0.6f);
+        float fogEnd   = (activeRD-0.3f)*CHUNK_SIZE * (1.0f - depthFade*0.5f);
         SetShaderValue(worldShader, locFogStart, &fogStart, SHADER_UNIFORM_FLOAT);
         SetShaderValue(worldShader, locFogEnd,   &fogEnd,   SHADER_UNIFORM_FLOAT);
 
@@ -2127,7 +2288,7 @@ struct World {
             for(int x=0;x<CHUNK_SIZE;x++) for(int z=0;z<CHUNK_SIZE;z++){
                 int wx=job.cx*CHUNK_SIZE+x, wz=job.cz*CHUNK_SIZE+z;
                 float n=wNoise.GetNoise((float)wx,(float)wz);
-                int h=(int)(n*12.0f)+440;
+                int h=(int)(n*12.0f)+200;
                 for(int y=0;y<CHUNK_HEIGHT;y++){
                     int idx=x*CHUNK_HEIGHT*CHUNK_SIZE+y*CHUNK_SIZE+z;
                     BlockType base;
@@ -2145,10 +2306,10 @@ struct World {
                     if(base==BLOCK_STONE){
                         float ov =wOre.GetNoise((float)wx,(float)y,(float)wz);
                         float ov2=wOre.GetNoise((float)wx*1.7f+100,(float)y*1.7f,(float)wz*1.7f+100);
-                        if     (y<=380&&ov>0.55f&&ov2>0.10f) base=BLOCK_COAL;
-                        else if(y<=300&&ov>0.62f&&ov2>0.15f) base=BLOCK_IRON;
-                        else if(y<=180&&ov>0.70f&&ov2>0.20f) base=BLOCK_GOLD;
-                        else if(y<=80 &&ov>0.76f&&ov2>0.25f) base=BLOCK_DIAMOND;
+                        if     (y<=180&&ov>0.55f&&ov2>0.10f) base=BLOCK_COAL;
+                        else if(y<=130&&ov>0.62f&&ov2>0.15f) base=BLOCK_IRON;
+                        else if(y<= 80&&ov>0.70f&&ov2>0.20f) base=BLOCK_GOLD;
+                        else if(y<= 30&&ov>0.76f&&ov2>0.25f) base=BLOCK_DIAMOND;
                     }
                     rc.blocks[idx]=base;
                 }
@@ -2259,7 +2420,7 @@ struct World {
             for(int x=0;x<CHUNK_SIZE;x++) for(int z=0;z<CHUNK_SIZE;z++){
                 int wx=job.cx*CHUNK_SIZE+x, wz=job.cz*CHUNK_SIZE+z;
                 float n=wNoise.GetNoise((float)wx,(float)wz);
-                int h=(int)(n*12.0f)+440;
+                int h=(int)(n*12.0f)+200;
                 for(int y=0;y<CHUNK_HEIGHT;y++){
                     int idx=x*CHUNK_HEIGHT*CHUNK_SIZE+y*CHUNK_SIZE+z;
                     BlockType base;
@@ -2277,10 +2438,10 @@ struct World {
                     if(base==BLOCK_STONE){
                         float ov =wOre.GetNoise((float)wx,(float)y,(float)wz);
                         float ov2=wOre.GetNoise((float)wx*1.7f+100,(float)y*1.7f,(float)wz*1.7f+100);
-                        if     (y<=380&&ov>0.55f&&ov2>0.10f) base=BLOCK_COAL;
-                        else if(y<=300&&ov>0.62f&&ov2>0.15f) base=BLOCK_IRON;
-                        else if(y<=180&&ov>0.70f&&ov2>0.20f) base=BLOCK_GOLD;
-                        else if(y<=80 &&ov>0.76f&&ov2>0.25f) base=BLOCK_DIAMOND;
+                        if     (y<=180&&ov>0.55f&&ov2>0.10f) base=BLOCK_COAL;
+                        else if(y<=130&&ov>0.62f&&ov2>0.15f) base=BLOCK_IRON;
+                        else if(y<= 80&&ov>0.70f&&ov2>0.20f) base=BLOCK_GOLD;
+                        else if(y<= 30&&ov>0.76f&&ov2>0.25f) base=BLOCK_DIAMOND;
                     }
                     rc.blocks[idx]=base;
                 }
@@ -2383,8 +2544,8 @@ struct World {
         }
 
         // ── Queue missing chunks for async generation ─────────────────────────
-        for(int x=cx-RENDER_DISTANCE;x<=cx+RENDER_DISTANCE;x++)
-        for(int z=cz-RENDER_DISTANCE;z<=cz+RENDER_DISTANCE;z++){
+        for(int x=cx-activeRD;x<=cx+activeRD;x++)
+        for(int z=cz-activeRD;z<=cz+activeRD;z++){
             int64_t k=Key(x,z);
             if(chunks.find(k)==chunks.end() && inFlight.find(k)==inFlight.end()){
                 inFlight.insert(k);
@@ -2400,7 +2561,7 @@ struct World {
         // ── Unload distant chunks ─────────────────────────────────────────────
         std::vector<int64_t> rem;
         for(auto& [k,c]:chunks)
-            if(abs(c.chunkX-cx)>RENDER_DISTANCE+1||abs(c.chunkZ-cz)>RENDER_DISTANCE+1) rem.push_back(k);
+            if(abs(c.chunkX-cx)>activeRD+1||abs(c.chunkZ-cz)>activeRD+1) rem.push_back(k);
         if(!rem.empty()){ torchCacheDirty=true; sortedDirty=true; }
         for(auto& k:rem){
             auto& c=chunks[k];
@@ -2642,9 +2803,12 @@ struct World {
         SetShaderValue(godRayShader, locSunVisible, &vis, SHADER_UNIFORM_FLOAT);
 
         BeginShaderMode(godRayShader);
+            // Always blit to full screen — even if input is half-res, this upscales it.
+            // The bilinear filter on the texture handles the upscale cleanly.
+            int destW=GetScreenWidth(), destH=GetScreenHeight();
             DrawTexturePro(sceneTex.texture,
                 {0,0,(float)SW,-(float)SH},
-                {0,0,(float)SW, (float)SH},
+                {0,0,(float)destW,(float)destH},
                 {0,0}, 0.0f, WHITE);
         EndShaderMode();
     }
@@ -2950,7 +3114,8 @@ int main(){
     }
 
     int SW=GetScreenWidth(), SH=GetScreenHeight();
-    RenderTexture2D sceneTex=LoadRenderTexture(SW,SH);
+    RenderTexture2D sceneTex   = LoadRenderTexture(SW, SH);
+    RenderTexture2D godRaysTex = LoadRenderTexture(SW/2, SH/2); // half-res — ~60% cheaper
 
     // Breaking state
     float breakProgress = 0.0f;  // 0..1
@@ -2963,7 +3128,9 @@ int main(){
         if(IsWindowResized()){
             SW=GetScreenWidth(); SH=GetScreenHeight();
             UnloadRenderTexture(sceneTex);
-            sceneTex=LoadRenderTexture(SW,SH);
+            UnloadRenderTexture(godRaysTex);
+            sceneTex   = LoadRenderTexture(SW, SH);
+            godRaysTex = LoadRenderTexture(SW/2, SH/2);
         }
         // F11 — toggle borderless fullscreen
         if(IsKeyPressed(KEY_F11)) ToggleBorderlessWindowed();
@@ -2983,6 +3150,13 @@ int main(){
         }
 
         bool inGame = (gameState==STATE_PLAYING);
+
+        // ── Dynamic render distance — auto-drops when FPS tanks ──────────────
+        // Smoothed FPS so we don't thrash every frame.
+        static float smoothFPS = 60.0f;
+        smoothFPS = smoothFPS * 0.95f + (1.0f / (dt + 0.0001f)) * 0.05f;
+        int dynamicRD = (smoothFPS < 30.0f) ? 2 : RENDER_DISTANCE;
+        world.SetRenderDistance(dynamicRD);
         player.Update(world, inGame && cursorLocked);
         world.Update(player.pos);
         world.UpdateTime(dt);
@@ -3071,9 +3245,19 @@ int main(){
         // Post-process + present
         BeginDrawing();
             ClearBackground(BLACK);
-            if(settings.godRays)
-                world.DrawGodRays(sceneTex,cam,SW,SH);
-            else {
+            if(settings.godRays){
+                // Blit scene at half-res into godRaysTex, run god ray shader there,
+                // then upscale back to full screen. ~60% cheaper on slow GPUs.
+                BeginTextureMode(godRaysTex);
+                    DrawTexturePro(sceneTex.texture,
+                        {0,0,(float)SW,-(float)SH},
+                        {0,0,(float)SW/2,(float)SH/2},
+                        {0,0},0.0f,WHITE);
+                EndTextureMode();
+                world.DrawGodRays(godRaysTex,cam,SW/2,SH/2);
+                // Upscale the god-ray result to fill the screen
+                // (DrawGodRays already blitted into the default framebuffer)
+            } else {
                 // Just blit the scene without post-processing
                 DrawTexturePro(sceneTex.texture,
                     {0,0,(float)SW,-(float)SH},{0,0,(float)SW,(float)SH},
@@ -3268,6 +3452,7 @@ int main(){
     }
 
     UnloadRenderTexture(sceneTex);
+    UnloadRenderTexture(godRaysTex);
     world.Unload();
     CloseWindow();
     return 0;

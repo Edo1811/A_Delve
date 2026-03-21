@@ -3,7 +3,7 @@
 // ============================================================
 //  CONFIGURE THESE before each release / distribution:
 // ============================================================
-#define CURRENT_VERSION     "0.1.1"
+#define CURRENT_VERSION     "0.1.2"
 #define UPDATE_HOST         L"raw.githubusercontent.com"
 #define VERSION_PATH        L"/Edo1811/A_Delve/main/version.txt"
 #define DL_HOST             L"github.com"
